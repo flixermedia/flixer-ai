@@ -4,10 +4,12 @@ import asyncio
 import hashlib
 import logging
 import secrets
+import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from importlib.metadata import version
+from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -16,8 +18,11 @@ from pydantic import BaseModel, Field
 
 from .activity import activity_feed
 from .config import Settings
-from .flixer_client import FlixerClient, signature
+from .flixer_client import FlixerClient, secure_control_url, signature
 from .model_manager import ProfileManager
+from .log_context import LogContextMiddleware
+from .logger_export import start_logger, stop_logger
+from .logger_enrollment import run as enroll_logger
 from .profiles import ProfileError
 from .recommendation_cache import RecommendationCache, RecommendationRefreshRateLimited
 from .schemas import (
@@ -100,43 +105,66 @@ async def require_signed_admin(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings: Settings = app.state.settings
-    client = FlixerClient(settings)
-    try:
-        config = await client.runtime_configuration()
-        profile = config.get("profile")
-        enabled = config.get("enabled")
-        downloads = config.get("allowDownloads")
-        refresh_interval = config.get("cacheRefreshIntervalMinutes", 10)
-        if (
-            profile not in {"auto", "classic", "micro", "mini"}
-            or not isinstance(enabled, bool)
-            or not isinstance(downloads, bool)
-            or not isinstance(refresh_interval, int)
-            or isinstance(refresh_interval, bool)
-            or not 1 <= refresh_interval <= 1440
-        ):
-            raise RuntimeError("Flixer returned invalid AI runtime settings.")
-        settings = replace(settings, enabled=enabled, recommender_profile=profile, allow_downloads=downloads)
-        app.state.settings = settings
-        app.state.recommendation_cache.set_refresh_interval(refresh_interval)
-        logger.info("Loaded runtime AI configuration from Flixer.")
-    except RuntimeError as error:
-        logger.warning("Could not load runtime AI configuration from Flixer; using environment defaults: %s", error)
-    profile_manager = ProfileManager(settings)
-    app.state.profile_manager = profile_manager
-    app.state.flixer_client = client
-    profile_manager.start()
-    try:
+    async with AsyncExitStack() as stack:
+        settings: Settings = app.state.settings
+        client = FlixerClient(settings)
+        stack.push_async_callback(client.close)
+        manual_logger_config = Path("/run/flixer-logger/ai.json")
+        if not manual_logger_config.exists() and not manual_logger_config.is_symlink() and (settings.logger_control_socket or secure_control_url(settings.flixer_url)):
+            try:
+                directory = tempfile.TemporaryDirectory(prefix="flixer-ai-logger-")
+            except OSError as error:
+                logger.warning("Cannot initialize logger enrollment (%s); export is disabled.", type(error).__name__)
+                stack.callback(stop_logger, start_logger())
+            else:
+                stack.callback(directory.cleanup)
+                config_path = Path(directory.name) / "config.json"
+                stack.callback(stop_logger, start_logger(config_path))
+                enrollment = asyncio.create_task(enroll_logger(client, config_path))
+
+                async def stop_enrollment() -> None:
+                    enrollment.cancel()
+                    try:
+                        await enrollment
+                    except asyncio.CancelledError:
+                        pass
+
+                stack.push_async_callback(stop_enrollment)
+        else:
+            stack.callback(stop_logger, start_logger())
+        try:
+            config = await client.runtime_configuration()
+            profile = config.get("profile")
+            enabled = config.get("enabled")
+            downloads = config.get("allowDownloads")
+            refresh_interval = config.get("cacheRefreshIntervalMinutes", 10)
+            if (
+                profile not in {"auto", "classic", "micro", "mini"}
+                or not isinstance(enabled, bool)
+                or not isinstance(downloads, bool)
+                or not isinstance(refresh_interval, int)
+                or isinstance(refresh_interval, bool)
+                or not 1 <= refresh_interval <= 1440
+            ):
+                raise RuntimeError("Flixer returned invalid AI runtime settings.")
+            settings = replace(settings, enabled=enabled, recommender_profile=profile, allow_downloads=downloads)
+            app.state.settings = settings
+            app.state.recommendation_cache.set_refresh_interval(refresh_interval)
+            logger.info("Loaded runtime AI configuration from Flixer.")
+        except RuntimeError as error:
+            logger.warning("Could not load runtime AI configuration from Flixer; using environment defaults: %s", error)
+        profile_manager = ProfileManager(settings)
+        app.state.profile_manager = profile_manager
+        app.state.flixer_client = client
+        profile_manager.start()
+        stack.push_async_callback(profile_manager.stop)
+        stack.push_async_callback(app.state.recommendation_cache.close)
         yield
-    finally:
-        await app.state.recommendation_cache.close()
-        await profile_manager.stop()
-        await client.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Flixer AI", version=version("flixer-ai"), lifespan=lifespan)
+    app.add_middleware(LogContextMiddleware)
     app.state.settings = settings or Settings.from_env()
     app.state.recommendation_cache = RecommendationCache()
 
@@ -213,6 +241,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not load recommendation data from Flixer.") from error
 
         profile = manager.active_profile
+        inference_started = time.monotonic()
         try:
             items = await asyncio.to_thread(
                 profile.recommend,
@@ -232,7 +261,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 limit,
                 filters,
             )
-        logger.info("Recommendation refresh completed with %d results for user %s.", len(items), user_id)
+        logger.info(
+            "Recommendation refresh completed with %d results for user %s.", len(items), user_id,
+            extra={"duration_ms": round((time.monotonic() - inference_started) * 1000, 3),
+                   "model_profile": manager.active_profile.name, "result_count": len(items)},
+        )
         return RecommendationResponse(items=items)
 
     @app.post("/admin/users/{user_id}/recommendations/refresh", dependencies=[Depends(require_signed_admin)])
@@ -318,6 +351,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if source is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media item not found.")
         profile = manager.active_profile
+        inference_started = time.monotonic()
         try:
             items = await asyncio.to_thread(
                 profile.similar,
@@ -335,7 +369,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request.limit,
                 request.filters,
             )
-        logger.info("Similar-title request completed with %d results.", len(items))
+        logger.info(
+            "Similar-title request completed with %d results.", len(items),
+            extra={"duration_ms": round((time.monotonic() - inference_started) * 1000, 3),
+                   "model_profile": manager.active_profile.name, "result_count": len(items)},
+        )
         return RecommendationResponse(items=items)
 
     return app

@@ -91,3 +91,68 @@ descending order from 0 to 1.
 
 The service fetches data from signed internal Flixer API endpoints; it does not
 accept database credentials and does not persist recommendation results.
+
+## Experimental Flixer Logger export
+
+When Flixer is paired with a logger, AI can enroll automatically using its
+existing signed internal Flixer connection, provided `FLIXER_URL` is HTTPS or
+literal loopback HTTP, or `FLIXER_LOGGER_CONTROL_SOCKET` names Flixer's
+protected local Unix socket. Non-loopback plaintext connections cannot distribute
+logger credentials. The credential is application-bound to `flixer-ai`, stored
+encrypted by Flixer, and refreshed in a private temporary directory by AI every
+minute. It is not a new logger environment file. If enrollment fails, AI
+suspends export until a refresh succeeds. Since the internal signature uses the
+shared `APP_SECRET`, any service holding that secret and able to reach this
+endpoint can request the AI credential; it is not a separate AI identity.
+End-to-end TLS (or a trusted local TLS-terminating proxy) is required across
+all non-loopback network hops. When configured, the socket takes precedence
+and AI does not fall back to plaintext if the socket is unavailable.
+
+Alternatively, an owner-only file at `/run/flixer-logger/ai.json` provisioned
+for the AI service user takes precedence at process startup. The
+file contains JSON fields `endpoint` (an HTTPS origin, or literal loopback
+HTTP for development) and `token` (a deployment ingestion credential). It must
+be a regular, non-symlink file owned by the service user with no group or other
+permissions. Existing stdout/stderr logging remains enabled. Uvicorn access
+exports only the HTTP method and status, not the client address or request URL.
+Flixer recommendation calls carry a W3C `traceparent`; AI records inherit its
+validated trace ID and record request duration and HTTP status without storing
+request paths or bodies. Requests without a valid trace ID receive a new one.
+Background cache work can continue under the trace of the request that started
+it. These identifiers are correlation hints, not authentication.
+Flixer's request logs and AI's completion logs can be retrieved together using
+the logger's trace endpoint when both exporters use credentials for the same
+deployment. AI-to-Flixer callbacks propagate the same trace ID, and Flixer
+request logs accept valid W3C version-00 trace headers. The header is
+untrusted correlation metadata and does not authorize requests.
+Inference completion events also include elapsed milliseconds, the bounded
+profile name (`classic`, `micro` or `mini`), and result count when available;
+arbitrary model metadata and request payloads are not exported as fields.
+
+When the exporter started with a valid file, its worker rechecks that file at
+most once every five seconds when there are events to send. Atomically replace
+the file with another owner-only regular file to rotate a credential. Keep the
+old credential valid during the overlap: in-flight requests and retries may
+still use it until the worker reloads. An HTTP 401 triggers an immediate
+configuration recheck. A changed credential or endpoint discards queued events
+from the previous configuration, even when the endpoint is unchanged, so a
+credential for a different deployment cannot receive those events. If the file disappears or becomes
+invalid, export is suspended and batches are dropped until a valid file is
+available. An in-flight batch can still reach the previous endpoint.
+When a manual file is selected or automatic enrollment is unavailable, the service
+continues without export if that file is absent or invalid and checks for a
+valid file every five seconds. When automatic enrollment is selected, adding a
+manual file requires restarting AI. Events produced before attachment are
+not replayed. If the configuration watcher cannot start, the error is reported
+on stderr and AI continues without export; restart AI to try again.
+
+The bounded queue, retries and temporary delivery circuit can drop records;
+shutdown does not wait indefinitely. Producer and server redaction are
+best-effort and must not be relied on to make secrets safe to log. Automatic
+enrollment requires a protected control connection and a configured Flixer
+logger. When a credential issued with an ID by this version of Flixer is
+revoked through Flixer administration, Flixer clears it and AI obtains a new
+one on its next enrollment refresh. Revocation outside Flixer, or of an older
+credential whose ID was not recorded, is not automatically detected and
+requires reconnecting or re-pairing. This experimental path is not a complete
+production deployment setup.

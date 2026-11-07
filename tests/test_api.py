@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from types import SimpleNamespace
 
@@ -53,6 +54,28 @@ class FakeFlixerClient:
             ],
             history=[history_item],
         )
+
+
+def test_recommendation_inference_reports_bounded_operational_metadata(tmp_path, caplog) -> None:
+    settings = Settings(
+        port=8094, data_dir=tmp_path, models_dir=tmp_path / "models", recommender_profile="classic",
+        allow_downloads=False, flixer_url="http://flixer", internal_token="shared-token", enabled=True,
+    )
+    app = create_app(settings)
+    app.dependency_overrides[_flixer_client] = lambda: FakeFlixerClient()
+    app.dependency_overrides[_profile_manager] = lambda: SimpleNamespace(active_profile=ClassicProfile(), settings=settings)
+    with caplog.at_level(logging.INFO, logger="flixer_ai"):
+        response = TestClient(app).post(
+            "/v1/recommend",
+            headers={"X-Flixer-Internal-Token": "shared-token"},
+            json={"user_id": USER_ID, "limit": 5, "filters": {"types": ["movie"]}},
+        )
+    assert response.status_code == 200
+    records = [record for record in caplog.records if record.getMessage().startswith("Recommendation refresh completed")]
+    assert len(records) == 1
+    assert records[0].model_profile == "classic"
+    assert records[0].result_count == len(response.json()["items"])
+    assert records[0].duration_ms >= 0
 
 
 def test_recommend_requires_auth_and_returns_personalized_results(tmp_path) -> None:

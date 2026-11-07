@@ -42,6 +42,7 @@ class Settings:
     internal_token: str | None
     enabled: bool = False
     flixer_timeout_seconds: float = 15.0
+    logger_control_socket: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -62,5 +63,6 @@ class Settings:
             allow_downloads=_bool(os.getenv("ALLOW_DOWNLOADS"), True, "ALLOW_DOWNLOADS"),
             flixer_url=os.getenv("FLIXER_URL", "http://flixer:8080").rstrip("/"),
             internal_token=_read_secret(),
+            logger_control_socket=os.getenv("FLIXER_LOGGER_CONTROL_SOCKET", "").strip(),
             enabled=_bool(os.getenv("AI_ENABLED"), False, "AI_ENABLED"),
         )
