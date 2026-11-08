@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import secrets
 import tempfile
 import time
@@ -20,6 +21,7 @@ from .activity import activity_feed
 from .config import Settings
 from .flixer_client import FlixerClient, secure_control_url, signature
 from .model_manager import ProfileManager
+from .monitoring import flush as flush_monitoring, initialize as initialize_monitoring, load_configuration as load_monitoring
 from .log_context import LogContextMiddleware
 from .logger_export import start_logger, stop_logger
 from .logger_enrollment import run as enroll_logger
@@ -37,6 +39,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("flixer_ai")
+
+initialize_monitoring()
 
 MAX_ADMIN_CLOCK_SKEW_SECONDS = 300
 
@@ -107,6 +111,17 @@ async def require_signed_admin(
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         settings: Settings = app.state.settings
+        monitoring_task = asyncio.create_task(load_monitoring(settings.flixer_url))
+
+        async def stop_monitoring() -> None:
+            monitoring_task.cancel()
+            try:
+                await monitoring_task
+            except asyncio.CancelledError:
+                pass
+            flush_monitoring()
+
+        stack.push_async_callback(stop_monitoring)
         client = FlixerClient(settings)
         stack.push_async_callback(client.close)
         manual_logger_config = Path("/run/flixer-logger/ai.json")
@@ -163,7 +178,9 @@ async def lifespan(app: FastAPI):
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="Flixer AI", version=version("flixer-ai"), lifespan=lifespan)
+    installed_version = version("flixer-ai")
+    runtime_version = f"{installed_version}-dev" if os.environ.get("FLIXER_DEVELOPMENT_BUILD") == "true" else installed_version
+    app = FastAPI(title="Flixer AI", version=runtime_version, lifespan=lifespan)
     app.add_middleware(LogContextMiddleware)
     app.state.settings = settings or Settings.from_env()
     app.state.recommendation_cache = RecommendationCache()
@@ -172,6 +189,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz(manager: Annotated[ProfileManager, Depends(_profile_manager)]):
         return {
             "status": "ok",
+            "version": runtime_version,
             "activeProfile": manager.active_profile.name,
             "modelReady": manager.model_manager.model_ready,
         }

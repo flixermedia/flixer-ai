@@ -48,6 +48,9 @@ uvicorn flixer_ai.main:app --reload --port 8094
 pytest
 ```
 
+For a development checkout, set `FLIXER_DEVELOPMENT_BUILD=true` to report the
+installed package version with a `-dev` suffix in the health endpoint.
+
 Set `FLIXER_INTERNAL_TOKEN` (or `FLIXER_INTERNAL_TOKEN_FILE`) and
 `FLIXER_URL` before calling `/v1/recommend` or `/v1/similar`.
 
@@ -64,6 +67,16 @@ Set `FLIXER_INTERNAL_TOKEN` (or `FLIXER_INTERNAL_TOKEN_FILE`) and
 | `FLIXER_URL` | `http://flixer:8080` | Core Flixer API origin |
 | `FLIXER_INTERNAL_TOKEN` | unset | Shared Flixer app secret for service auth |
 | `FLIXER_INTERNAL_TOKEN_FILE` | `/run/flixer-secrets/app-secret` | File containing that shared secret |
+| `SENTRY_ENVIRONMENT` | `production` | Sentry environment label |
+
+When enabled, unhandled HTTP exceptions are reported without request data, exception
+text, stack traces, breadcrumbs, user information, or recommendation data. Reporting
+is configured in Flixer's General > Error Monitoring dashboard. The global and
+AI switches must both be enabled and the AI DSN set. Restart the service after
+changing these settings. If the API is unavailable at startup, AI retries with
+reporting disabled until it can load the configuration.
+Older `SENTRY_DSN` environment values are no longer used; copy the DSN to the
+dashboard before restarting an existing installation.
 
 `auto` chooses `mini` when at least 1.2 GiB of memory is available, `micro`
 when at least 512 MiB is available, and `classic` otherwise. Container memory

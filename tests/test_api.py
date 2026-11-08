@@ -100,12 +100,12 @@ def test_recommend_requires_auth_and_returns_personalized_results(tmp_path) -> N
         response = client.post(
             "/v1/recommend",
             headers={"X-Flixer-Internal-Token": "shared-token"},
-            json={"user_id": USER_ID, "limit": 5, "filters": {"genres": ["sci-fi"]}},
+            json={"user_id": USER_ID, "limit": 5, "filters": {"types": ["movie"], "genres": ["sci-fi"]}},
         )
         cached = client.post(
             "/v1/recommend",
             headers={"X-Flixer-Internal-Token": "shared-token"},
-            json={"user_id": USER_ID, "limit": 5, "filters": {"genres": ["sci-fi"]}},
+            json={"user_id": USER_ID, "limit": 5, "filters": {"types": ["movie"], "genres": ["sci-fi"]}},
         )
 
     assert response.status_code == 200
