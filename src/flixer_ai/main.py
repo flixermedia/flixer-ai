@@ -43,6 +43,7 @@ logger = logging.getLogger("flixer_ai")
 initialize_monitoring()
 
 MAX_ADMIN_CLOCK_SKEW_SECONDS = 300
+RUNTIME_CONFIGURATION_RETRY_SECONDS = 10
 
 
 def recommendation_scope(filters: RecommendationFilters | None) -> str:
@@ -59,6 +60,51 @@ class AdminConfiguration(BaseModel):
     profile: Literal["auto", "classic", "micro", "mini"]
     allow_downloads: bool
     cache_refresh_interval_minutes: int = Field(default=10, ge=1, le=1440)
+
+
+async def load_runtime_configuration(client: FlixerClient) -> AdminConfiguration:
+    config = await client.runtime_configuration()
+    profile = config.get("profile")
+    enabled = config.get("enabled")
+    downloads = config.get("allowDownloads")
+    refresh_interval = config.get("cacheRefreshIntervalMinutes", 10)
+    if (
+        not isinstance(profile, str)
+        or profile not in {"auto", "classic", "micro", "mini"}
+        or not isinstance(enabled, bool)
+        or not isinstance(downloads, bool)
+        or not isinstance(refresh_interval, int)
+        or isinstance(refresh_interval, bool)
+        or not 1 <= refresh_interval <= 1440
+    ):
+        raise RuntimeError("Flixer returned invalid AI runtime settings.")
+    return AdminConfiguration(enabled=enabled, profile=profile, allow_downloads=downloads, cache_refresh_interval_minutes=refresh_interval)
+
+
+async def retry_runtime_configuration(app: FastAPI, client: FlixerClient, generation: int) -> None:
+    cache_needs_clear = False
+    while True:
+        await asyncio.sleep(RUNTIME_CONFIGURATION_RETRY_SECONDS)
+        try:
+            config = await load_runtime_configuration(client)
+            async with app.state.runtime_configuration_lock:
+                if app.state.runtime_configuration_generation != generation:
+                    return
+                manager: ProfileManager = app.state.profile_manager
+                if (manager.settings.enabled != config.enabled or manager.requested_profile != config.profile
+                    or manager.settings.allow_downloads != config.allow_downloads):
+                    await manager.configure(config.enabled, config.profile, config.allow_downloads)
+                    app.state.settings = manager.settings
+                    cache_needs_clear = True
+                if cache_needs_clear:
+                    await app.state.recommendation_cache.clear(client)
+                    cache_needs_clear = False
+                app.state.recommendation_cache.set_refresh_interval(config.cache_refresh_interval_minutes)
+                app.state.settings = manager.settings
+            logger.info("Loaded runtime AI configuration from Flixer after retry.")
+            return
+        except RuntimeError as error:
+            logger.warning("Could not load runtime AI configuration from Flixer; retrying: %s", error)
 
 
 def _settings(request: Request) -> Settings:
@@ -147,33 +193,33 @@ async def lifespan(app: FastAPI):
                 stack.push_async_callback(stop_enrollment)
         else:
             stack.callback(stop_logger, start_logger())
+        retry_configuration = False
         try:
-            config = await client.runtime_configuration()
-            profile = config.get("profile")
-            enabled = config.get("enabled")
-            downloads = config.get("allowDownloads")
-            refresh_interval = config.get("cacheRefreshIntervalMinutes", 10)
-            if (
-                profile not in {"auto", "classic", "micro", "mini"}
-                or not isinstance(enabled, bool)
-                or not isinstance(downloads, bool)
-                or not isinstance(refresh_interval, int)
-                or isinstance(refresh_interval, bool)
-                or not 1 <= refresh_interval <= 1440
-            ):
-                raise RuntimeError("Flixer returned invalid AI runtime settings.")
-            settings = replace(settings, enabled=enabled, recommender_profile=profile, allow_downloads=downloads)
+            config = await load_runtime_configuration(client)
+            settings = replace(settings, enabled=config.enabled, recommender_profile=config.profile, allow_downloads=config.allow_downloads)
             app.state.settings = settings
-            app.state.recommendation_cache.set_refresh_interval(refresh_interval)
+            app.state.recommendation_cache.set_refresh_interval(config.cache_refresh_interval_minutes)
             logger.info("Loaded runtime AI configuration from Flixer.")
         except RuntimeError as error:
-            logger.warning("Could not load runtime AI configuration from Flixer; using environment defaults: %s", error)
+            retry_configuration = True
+            logger.warning("Could not load runtime AI configuration from Flixer; using environment defaults and retrying: %s", error)
         profile_manager = ProfileManager(settings)
         app.state.profile_manager = profile_manager
         app.state.flixer_client = client
         profile_manager.start()
         stack.push_async_callback(profile_manager.stop)
         stack.push_async_callback(app.state.recommendation_cache.close)
+        if retry_configuration:
+            configuration_task = asyncio.create_task(retry_runtime_configuration(app, client, app.state.runtime_configuration_generation))
+
+            async def stop_configuration_retry() -> None:
+                configuration_task.cancel()
+                try:
+                    await configuration_task
+                except asyncio.CancelledError:
+                    pass
+
+            stack.push_async_callback(stop_configuration_retry)
         yield
 
 
@@ -184,6 +230,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(LogContextMiddleware)
     app.state.settings = settings or Settings.from_env()
     app.state.recommendation_cache = RecommendationCache()
+    app.state.runtime_configuration_lock = asyncio.Lock()
+    app.state.runtime_configuration_generation = 0
 
     @app.get("/healthz")
     async def healthz(manager: Annotated[ProfileManager, Depends(_profile_manager)]):
@@ -216,15 +264,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         recommendation_cache: Annotated[RecommendationCache, Depends(_recommendation_cache)],
         client: Annotated[FlixerClient, Depends(_flixer_client)],
     ):
-        profile_configuration_changed = (
-            manager.settings.enabled != config.enabled
-            or manager.requested_profile != config.profile
-            or manager.settings.allow_downloads != config.allow_downloads
-        )
-        if profile_configuration_changed:
-            await manager.configure(config.enabled, config.profile, config.allow_downloads)
-            await recommendation_cache.clear(client)
-        recommendation_cache.set_refresh_interval(config.cache_refresh_interval_minutes)
+        async with app.state.runtime_configuration_lock:
+            app.state.runtime_configuration_generation += 1
+            profile_configuration_changed = (
+                manager.settings.enabled != config.enabled
+                or manager.requested_profile != config.profile
+                or manager.settings.allow_downloads != config.allow_downloads
+            )
+            if profile_configuration_changed:
+                await manager.configure(config.enabled, config.profile, config.allow_downloads)
+                await recommendation_cache.clear(client)
+            recommendation_cache.set_refresh_interval(config.cache_refresh_interval_minutes)
+            app.state.settings = manager.settings
         return {
             "accepted": True,
             "status": manager.status,
@@ -311,6 +362,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return await recommendation_cache.force_refresh(str(user_id), request_key, create, client, "movies")
         except RuntimeError as error:
             logger.warning("Could not read or store recommendation cache for user %s: %s", user_id, error)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not access the recommendation cache.") from error
+
+    @app.post("/v1/recommend/refresh", dependencies=[Depends(require_internal_auth)], response_model=RecommendationResponse)
+    async def refresh_recommendations(
+        request: RecommendRequest,
+        manager: Annotated[ProfileManager, Depends(_profile_manager)],
+        client: Annotated[FlixerClient, Depends(_flixer_client)],
+        recommendation_cache: Annotated[RecommendationCache, Depends(_recommendation_cache)],
+    ):
+        if not manager.settings.enabled:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="AI recommendations are disabled.")
+        request_key = hashlib.sha256(request.model_dump_json(exclude={"user_id"}, exclude_none=True).encode("utf-8")).hexdigest()
+
+        async def create() -> RecommendationResponse:
+            return await generate_recommendations(request.user_id, request.limit, request.filters, manager, client)
+
+        try:
+            return await recommendation_cache.force_refresh(
+                str(request.user_id), request_key, create, client, recommendation_scope(request.filters),
+                persist_before=False,
+            )
+        except RuntimeError as error:
+            logger.warning("Could not read or store recommendation cache for user %s: %s", request.user_id, error)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not access the recommendation cache.") from error
 
     @app.post("/v1/recommend", dependencies=[Depends(require_internal_auth)], response_model=RecommendationResponse)

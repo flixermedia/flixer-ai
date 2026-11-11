@@ -1,17 +1,84 @@
+import asyncio
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
 from flixer_ai.config import Settings
 from flixer_ai.flixer_client import signature
-from flixer_ai.main import _flixer_client, _profile_manager, create_app
+from flixer_ai.main import _flixer_client, _profile_manager, create_app, retry_runtime_configuration
 from flixer_ai.profiles import ClassicProfile
 from flixer_ai.schemas import MediaItem, RecommendationContext, WatchHistoryItem
 
 USER_ID = "00000000-0000-4000-8000-000000000001"
+
+
+def test_runtime_configuration_recovers_after_flixer_starts(tmp_path, monkeypatch) -> None:
+    import flixer_ai.main as main
+
+    calls = 0
+    applied = threading.Event()
+    original_set_interval = main.RecommendationCache.set_refresh_interval
+
+    async def runtime_configuration(_client):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("Flixer is starting")
+        return {"enabled": True, "profile": "classic", "allowDownloads": False, "cacheRefreshIntervalMinutes": 7}
+
+    async def clear_cache(_client):
+        return None
+
+    def set_interval(cache, minutes):
+        original_set_interval(cache, minutes)
+        if minutes == 7:
+            applied.set()
+
+    monkeypatch.setattr(main, "RUNTIME_CONFIGURATION_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(main.FlixerClient, "runtime_configuration", runtime_configuration)
+    monkeypatch.setattr(main.FlixerClient, "clear_recommendation_cache", clear_cache)
+    monkeypatch.setattr(main.RecommendationCache, "set_refresh_interval", set_interval)
+    settings = Settings(port=8094, data_dir=tmp_path, models_dir=tmp_path / "models", recommender_profile="auto", allow_downloads=True, flixer_url="http://flixer", internal_token="shared-token")
+    app = create_app(settings)
+
+    with TestClient(app):
+        assert applied.wait(timeout=5)
+        assert app.state.profile_manager.settings.enabled is True
+        assert app.state.profile_manager.requested_profile == "classic"
+        assert app.state.profile_manager.settings.allow_downloads is False
+        assert app.state.recommendation_cache.refresh_interval_minutes == 7
+        assert calls == 3
+
+
+def test_runtime_retry_does_not_override_a_newer_admin_update(monkeypatch) -> None:
+    import flixer_ai.main as main
+
+    monkeypatch.setattr(main, "RUNTIME_CONFIGURATION_RETRY_SECONDS", 0)
+
+    async def check():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def runtime_configuration():
+            started.set()
+            await release.wait()
+            return {"enabled": True, "profile": "classic", "allowDownloads": False, "cacheRefreshIntervalMinutes": 7}
+
+        manager = SimpleNamespace(configure=AsyncMock())
+        app = SimpleNamespace(state=SimpleNamespace(runtime_configuration_lock=asyncio.Lock(), runtime_configuration_generation=0, profile_manager=manager))
+        task = asyncio.create_task(retry_runtime_configuration(app, SimpleNamespace(runtime_configuration=runtime_configuration), 0))
+        await started.wait()
+        app.state.runtime_configuration_generation += 1
+        release.set()
+        await task
+        manager.configure.assert_not_awaited()
+
+    asyncio.run(check())
 
 
 class FakeFlixerClient:
@@ -114,6 +181,26 @@ def test_recommend_requires_auth_and_returns_personalized_results(tmp_path) -> N
     assert 0 < result[0]["score"] <= 1
     assert cached.json() == response.json()
     assert flixer_client.recommendation_calls == 1
+
+
+def test_missing_cache_refresh_requires_auth_and_stores_fresh_results(tmp_path) -> None:
+    settings = Settings(
+        port=8094, data_dir=tmp_path, models_dir=tmp_path / "models", recommender_profile="classic",
+        allow_downloads=False, flixer_url="http://flixer", internal_token="shared-token", enabled=True,
+    )
+    app = create_app(settings)
+    flixer_client = FakeFlixerClient()
+    app.dependency_overrides[_flixer_client] = lambda: flixer_client
+    request = {"user_id": USER_ID, "limit": 20, "filters": {"types": ["album"]}}
+
+    with TestClient(app) as client:
+        assert client.post("/v1/recommend/refresh", json=request).status_code == 401
+        response = client.post("/v1/recommend/refresh", headers={"X-Flixer-Internal-Token": "shared-token"}, json=request)
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == ["00000000-0000-4000-8000-000000000006"]
+    entries = flixer_client.cache_states[USER_ID]["entries"]
+    assert next(iter(entries.values()))["items"] == response.json()["items"]
 
 
 def test_music_and_screen_recommendations_do_not_share_cached_results(tmp_path) -> None:

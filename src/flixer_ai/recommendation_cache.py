@@ -118,6 +118,8 @@ class RecommendationCache:
         create: Callable[[], Awaitable[RecommendationResponse]],
         store: RecommendationCacheStore | None = None,
         scope: str = "general",
+        *,
+        persist_before: bool = True,
     ) -> RecommendationResponse:
         await self._ensure_loaded(user_id, store)
         key = (user_id, request_key)
@@ -126,7 +128,7 @@ class RecommendationCache:
                 task = self._refresh_tasks.get(key)
                 scheduled = task is None
                 if task is None:
-                    self._schedule_refresh(key, create, store, scope, preserve_cache=False)
+                    self._schedule_refresh(key, create, store, scope, preserve_cache=False, persist_before=persist_before)
                     task = self._refresh_tasks[key]
             await task
             if scheduled:
@@ -197,10 +199,11 @@ class RecommendationCache:
         scope: str,
         *,
         preserve_cache: bool,
+        persist_before: bool = True,
     ) -> None:
         self._last_refresh_by_user[(key[0], scope)] = self._clock()
         self._entry_scopes[key] = scope
-        self._refresh_tasks[key] = asyncio.create_task(self._populate(key, create, store, scope, preserve_cache))
+        self._refresh_tasks[key] = asyncio.create_task(self._populate(key, create, store, scope, preserve_cache, persist_before))
 
     async def _populate(
         self,
@@ -209,9 +212,11 @@ class RecommendationCache:
         store: RecommendationCacheStore | None,
         scope: str,
         preserve_cache: bool,
+        persist_before: bool,
     ) -> None:
         try:
-            await self._persist_user(key[0], store)
+            if persist_before:
+                await self._persist_user(key[0], store)
             result = await create()
             async with self._lock:
                 self._entries[key] = result
@@ -225,10 +230,11 @@ class RecommendationCache:
                     self._last_refresh_by_user.pop((key[0], scope), None)
                     if key not in self._entries:
                         self._entry_scopes.pop(key, None)
-                try:
-                    await self._save_user(key[0], store)
-                except Exception:
-                    logger.exception("Could not clear failed refresh throttle for user %s.", key[0])
+                if persist_before:
+                    try:
+                        await self._save_user(key[0], store)
+                    except Exception:
+                        logger.exception("Could not clear failed refresh throttle for user %s.", key[0])
                 raise
         finally:
             async with self._lock:

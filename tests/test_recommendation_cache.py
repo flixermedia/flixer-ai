@@ -132,6 +132,49 @@ def test_failed_initial_refresh_does_not_block_an_immediate_retry() -> None:
     asyncio.run(run())
 
 
+def test_missing_database_cache_is_not_repopulated_until_generation_succeeds() -> None:
+    async def run() -> None:
+        cache = RecommendationCache()
+        store = FakeCacheStore()
+        old = RecommendationResponse(items=[ScoredItem(id="old", score=0.7)])
+        fresh = RecommendationResponse(items=[ScoredItem(id="fresh", score=0.9)])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def original() -> RecommendationResponse:
+            return old
+
+        async def generate() -> RecommendationResponse:
+            started.set()
+            await release.wait()
+            return fresh
+
+        await cache.get_or_create("user", "a" * 64, original, store, "movies")
+        store.states.clear()
+        task = asyncio.create_task(cache.force_refresh("user", "a" * 64, generate, store, "movies", persist_before=False))
+        await started.wait()
+        assert "user" not in store.states
+        release.set()
+        assert await task == fresh
+        assert store.states["user"]["entries"]["a" * 64]["items"][0]["id"] == "fresh"
+
+        store.states.clear()
+
+        async def fail() -> RecommendationResponse:
+            raise RuntimeError("failed")
+
+        try:
+            await cache.force_refresh("user", "a" * 64, fail, store, "movies", persist_before=False)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Expected generation failure")
+        assert "user" not in store.states
+        await cache.close()
+
+    asyncio.run(run())
+
+
 def test_persisted_cache_and_user_throttle_survive_service_restart() -> None:
     async def run() -> None:
         now = 1_000_000.0
