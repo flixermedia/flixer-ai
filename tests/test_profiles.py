@@ -1,5 +1,5 @@
 from flixer_ai.profiles import ClassicProfile, EmbeddingProfile, completion_weight
-from flixer_ai.schemas import MediaItem, RecommendationFilters, WatchHistoryItem
+from flixer_ai.schemas import MediaItem, RecommendationFeedbackItem, RecommendationFilters, WatchHistoryItem
 
 
 def media_item(item_id: str, title: str, *, genres: list[str] | None = None, year: int | None = 2020) -> MediaItem:
@@ -65,3 +65,29 @@ def test_watch_history_weight_decays_with_age() -> None:
     )
 
     assert completion_weight(recent) > completion_weight(old)
+
+
+def test_dismissed_title_is_excluded_and_steers_classic_recommendations() -> None:
+    history = [WatchHistoryItem(**media_item("1", "Space adventure", genres=["Sci-Fi"]).model_dump(), completed=True)]
+    dismissed = RecommendationFeedbackItem(**media_item("2", "Space horror", genres=["Sci-Fi", "Horror"]).model_dump(), feedback="dismiss")
+    candidates = [media_item("2", "Space horror", genres=["Sci-Fi", "Horror"]), media_item("3", "Space horror journey", genres=["Sci-Fi", "Horror"]), media_item("4", "Space adventure journey", genres=["Sci-Fi"])]
+    profile = ClassicProfile()
+    baseline = {item.id: item.score for item in profile.recommend(history, [], candidates, 10)}
+    result = profile.recommend(history, [], candidates, 10, feedback=[dismissed])
+    scored = {item.id: item.score for item in result}
+    assert "2" not in scored
+    assert scored.get("3", 0) < baseline["3"]
+
+
+def test_dismissed_title_steers_embedding_recommendations() -> None:
+    class FakeEmbedder:
+        def embed(self, texts: list[str]):
+            import numpy as np
+
+            return np.asarray([[1.0, 0.0] if "space" in text.casefold() else [0.0, 1.0] for text in texts], dtype=np.float32)
+
+    history = [WatchHistoryItem(**media_item("1", "Space adventure").model_dump(), completed=True)]
+    dismissed = RecommendationFeedbackItem(**media_item("2", "Space horror").model_dump(), feedback="dismiss")
+    candidates = [media_item("2", "Space horror"), media_item("3", "Space journey")]
+    result = EmbeddingProfile("test", FakeEmbedder()).recommend(history, [], candidates, 10, feedback=[dismissed])
+    assert result == []

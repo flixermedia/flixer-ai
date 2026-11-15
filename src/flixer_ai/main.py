@@ -319,6 +319,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 context.candidates,
                 limit,
                 filters,
+                context.feedback,
             )
         except ProfileError as error:
             await manager.use_classic_after_error(error)
@@ -329,6 +330,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 context.candidates,
                 limit,
                 filters,
+                context.feedback,
             )
         logger.info(
             "Recommendation refresh completed with %d results for user %s.", len(items), user_id,

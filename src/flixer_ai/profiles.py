@@ -9,7 +9,7 @@ from typing import Protocol
 import numpy as np
 
 from .features import text_for, tokens_for
-from .schemas import MediaItem, RecommendationFilters, ScoredItem, WatchHistoryItem
+from .schemas import MediaItem, RecommendationFeedbackItem, RecommendationFilters, ScoredItem, WatchHistoryItem
 
 
 class ProfileError(RuntimeError):
@@ -30,6 +30,7 @@ class RecommenderProfile(Protocol):
         candidates: list[MediaItem],
         limit: int,
         filters: RecommendationFilters | None = None,
+        feedback: list[RecommendationFeedbackItem] | None = None,
     ) -> list[ScoredItem]: ...
 
     def similar(
@@ -127,7 +128,7 @@ class ClassicProfile:
             if candidate.id in source_ids:
                 continue
             candidate_vector = vectors[len(sources) + index]
-            weight_total = sum(weight for _, weight in source_vectors)
+            weight_total = sum(abs(weight) for _, weight in source_vectors)
             score = (
                 sum(self._cosine(source_vector, candidate_vector) * weight for source_vector, weight in source_vectors)
                 / weight_total
@@ -146,11 +147,16 @@ class ClassicProfile:
         candidates: list[MediaItem],
         limit: int,
         filters: RecommendationFilters | None = None,
+        feedback: list[RecommendationFeedbackItem] | None = None,
     ) -> list[ScoredItem]:
         watched = {item.id for item in history if item.completed or completion_weight(item) >= 0.95}
-        eligible = [candidate for candidate in candidates if candidate.id not in watched]
+        feedback = feedback or []
+        dismissed = {item.id for item in feedback if item.feedback == "dismiss"}
+        eligible = [candidate for candidate in candidates if candidate.id not in watched and candidate.id not in dismissed]
         sources = [(item, completion_weight(item)) for item in history]
         sources.extend((item, 1.5) for item in favorites)
+        sources.extend((item, 1.5) for item in feedback if item.feedback == "more_like_this")
+        sources.extend((item, -1.0) for item in feedback if item.feedback in {"dismiss", "less_like_this"})
         return self._rank(sources, eligible, limit, filters)
 
     def similar(
@@ -188,7 +194,7 @@ class EmbeddingProfile:
         except Exception as error:
             raise ProfileError(f"{self.name} embedding failed.") from error
         weights = np.asarray([weight for _, weight in sources], dtype=np.float32)
-        taste = np.average(source_vectors, axis=0, weights=weights)
+        taste = np.sum(source_vectors * weights[:, np.newaxis], axis=0) / np.sum(np.abs(weights))
         taste_norm = np.linalg.norm(taste)
         if taste_norm:
             taste = taste / taste_norm
@@ -203,11 +209,16 @@ class EmbeddingProfile:
         candidates: list[MediaItem],
         limit: int,
         filters: RecommendationFilters | None = None,
+        feedback: list[RecommendationFeedbackItem] | None = None,
     ) -> list[ScoredItem]:
         watched = {item.id for item in history if item.completed or completion_weight(item) >= 0.95}
-        eligible = [candidate for candidate in candidates if candidate.id not in watched]
+        feedback = feedback or []
+        dismissed = {item.id for item in feedback if item.feedback == "dismiss"}
+        eligible = [candidate for candidate in candidates if candidate.id not in watched and candidate.id not in dismissed]
         sources = [(item, completion_weight(item)) for item in history]
         sources.extend((item, 1.5) for item in favorites)
+        sources.extend((item, 1.5) for item in feedback if item.feedback == "more_like_this")
+        sources.extend((item, -1.0) for item in feedback if item.feedback in {"dismiss", "less_like_this"})
         return self._rank(sources, eligible, limit, filters)
 
     def similar(

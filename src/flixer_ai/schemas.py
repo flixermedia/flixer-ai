@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -59,10 +59,15 @@ class FavoriteItem(MediaItem):
     created_at: str | None = None
 
 
+class RecommendationFeedbackItem(MediaItem):
+    feedback: Literal["dismiss", "more_like_this", "less_like_this"]
+
+
 class RecommendationContext(BaseModel):
     candidates: list[MediaItem] = Field(default_factory=list)
     history: list[WatchHistoryItem] = Field(default_factory=list)
     favorites: list[FavoriteItem] = Field(default_factory=list)
+    feedback: list[RecommendationFeedbackItem] = Field(default_factory=list)
 
 
 class ScoredItem(BaseModel):
