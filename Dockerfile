@@ -18,12 +18,12 @@ COPY src ./src
 
 RUN pip install --no-cache-dir .
 
-RUN groupadd --system --gid 10001 flixer-ai \
-    && useradd --system --uid 10001 --gid flixer-ai --home-dir /nonexistent --shell /usr/sbin/nologin flixer-ai \
+RUN groupadd --system --gid 1000 flixer-ai \
+    && useradd --system --uid 1000 --gid flixer-ai --home-dir /nonexistent --shell /usr/sbin/nologin flixer-ai \
     && mkdir -p /data/ai/models \
-    && chown -R 10001:10001 /data/ai
+    && chown -R 1000:1000 /data/ai
 
-USER 10001:10001
+USER 1000:1000
 
 EXPOSE 8094
 
